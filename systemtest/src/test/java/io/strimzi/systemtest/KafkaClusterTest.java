@@ -4,6 +4,8 @@
  */
 package io.strimzi.systemtest;
 
+import io.strimzi.systemtest.clients.KafkaConsumer;
+import io.strimzi.systemtest.clients.KafkaProducer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
@@ -28,12 +30,16 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.apache.commons.collections4.CollectionUtils;
+import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
+
+import static io.strimzi.test.TestUtils.getContent;
 import static io.strimzi.test.TestUtils.indent;
 import static io.strimzi.test.TestUtils.map;
 import static junit.framework.TestCase.assertTrue;
@@ -78,6 +84,10 @@ public class KafkaClusterTest {
 
     private static String kafkaPVCName(String clusterName, int podId) {
         return "data-" + kafkaStatefulSetName(clusterName) + "-" + podId;
+    }
+
+    private static String topicControllerName(String clusterName) {
+        return clusterName + "-topic-controller";
     }
 
     @BeforeClass
@@ -361,6 +371,50 @@ public class KafkaClusterTest {
             String initialDelaySecondsPath = "$.spec.containers[*].livenessProbe.initialDelaySeconds";
             assertEquals("23", getValueFromJson(zkPodJson, initialDelaySecondsPath));
         }
+    }
+
+    @Test
+    @Resources(value = "../examples/templates/cluster-controller", asAdmin = true)
+    @OpenShiftOnly
+    public void testSendMessages() {
+        String topicName = "test-topic";
+        Oc oc = (Oc) this.kubeClient;
+        int messagesCount = 5;
+        oc.namespace();
+        String clusterName = "openshift-my-cluster";
+        oc.newApp("strimzi-ephemeral", map("CLUSTER_NAME", clusterName));
+        oc.waitForStatefulSet(zookeeperStatefulSetName(clusterName), 1);
+        oc.waitForStatefulSet(kafkaStatefulSetName(clusterName), 3);
+        String bootstrapServers = "";
+        for (int i = 0; i < 3; i++) {
+            String kafkaPodJson = oc.getResourceAsJson("pod", kafkaPodName(clusterName, i));
+            bootstrapServers = bootstrapServers + JsonPath.parse(kafkaPodJson).read("$.status.podIP").toString() + ":9092,";
+        }
+        bootstrapServers = bootstrapServers.substring(0, bootstrapServers.length() - 1);
+
+        String yaml = getContent(new File("../examples/configmaps/topic-controller/kafka-topic-configmap.yaml"), node -> {
+            JsonNode metadata = node.get("metadata");
+            ((ObjectNode) metadata).put("name", topicName);
+            JsonNode labels = metadata.get("labels");
+            ((ObjectNode) labels).put("strimzi.io/cluster", clusterName);
+            JsonNode data = node.get("data");
+            ((ObjectNode) data).put("name", topicName);
+        });
+        oc.createContent(yaml);
+        oc.waitForDeployment(topicControllerName(clusterName));
+
+        KafkaProducer producer = new KafkaProducer("my-topic", bootstrapServers);
+        List<String> sentMessages = producer.runProducer(5);
+
+        KafkaConsumer consumer = new KafkaConsumer("my-topic", bootstrapServers);
+        List<String> consumedMessages = consumer.runConsumer();
+
+        LOGGER.info("Comparing lists of sent and received messages");
+        assertTrue(CollectionUtils.isEqualCollection(sentMessages, consumedMessages));
+
+        oc.deleteByName("cm", clusterName);
+        oc.waitForResourceDeletion("statefulset", kafkaStatefulSetName(clusterName));
+        oc.waitForResourceDeletion("statefulset", zookeeperStatefulSetName(clusterName));
     }
 
     private String getValueFromJson(String json, String jsonPath) {
